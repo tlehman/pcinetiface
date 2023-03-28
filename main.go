@@ -1,28 +1,27 @@
 package main
 
 import (
-	"bytes"
-	"encoding/xml"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os/exec"
 	"strings"
 )
 
-type Lshw struct {
-	XMLName xml.Name `xml:"node"`
-	Nodes   []Node   `xml:"node"`
-}
-
 type Node struct {
-	XMLName xml.Name `xml:"node"`
-	Class   string   `xml:"class,attr"`
-	Id      string   `xml:"id,attr"`
-	Nodes   []Node   `xml:"node"`
+	Class       string `json:"class"`
+	Id          string `json:"id"`
+	BusInfo     string `json:"businfo"`
+	LogicalName string `json:"logicalname"`
+	Config      struct {
+		Children []Node `json:"children"`
+	} `json:"configuration"`
 }
 
 type DeviceInfo struct {
-	PCIAddress        string
-	NetworkInterface  string
+	PCIAddress       string
+	NetworkInterface string
+	LinkState        string // "UP", "DOWN"
 }
 
 func main() {
@@ -33,44 +32,64 @@ func main() {
 	}
 
 	for _, device := range devices {
-		fmt.Printf("PCIAddress: %s, NetworkInterface: %s\n", device.PCIAddress, device.NetworkInterface)
+		fmt.Printf(
+			"PCIAddress: %s, NetworkInterface: %s, LinkState: %s\n",
+			device.PCIAddress,
+			device.NetworkInterface,
+			device.LinkState,
+		)
 	}
 }
 
 func getPCIDevices() ([]DeviceInfo, error) {
-	cmd := exec.Command("lshw", "-xml")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := cmd.Run()
+	cmd := exec.Command("lshw", "-class", "network", "-json")
+	out, err := cmd.Output()
 
 	if err != nil {
 		return nil, err
 	}
 
-	var lshwData Lshw
-	err = xml.Unmarshal(out.Bytes(), &lshwData)
+	var lshwData []Node
+	err = json.Unmarshal(out, &lshwData)
 	if err != nil {
 		return nil, err
 	}
 
 	var devices []DeviceInfo
-	for _, node := range lshwData.Nodes {
-		if node.Class == "network" {
-			pciAddress := ""
-			networkInterface := ""
-			for _, childNode := range node.Nodes {
-				if childNode.Class == "pci" {
-					pciAddress = strings.TrimPrefix(childNode.Id, "pci:")
-				} else if childNode.Class == "interface" {
-					networkInterface = childNode.Id
-				}
-			}
-			if pciAddress != "" && networkInterface != "" {
-				devices = append(devices, DeviceInfo{PCIAddress: pciAddress, NetworkInterface: networkInterface})
-			}
-		}
-	}
-
+	findPCIDevices(lshwData, &devices)
 	return devices, nil
 }
 
+func findPCIDevices(nodes []Node, devices *[]DeviceInfo) {
+	for _, node := range nodes {
+		if node.Class == "network" {
+			pciAddress := ""
+			networkInterface := ""
+			if strings.HasPrefix(node.BusInfo, "pci") {
+				pciAddress = strings.TrimPrefix(node.BusInfo, "pci:")
+				networkInterface = node.LogicalName
+				linkState, err := getLinkState(networkInterface)
+
+				if err != nil {
+					fmt.Printf("error getting link state: %s\n", err)
+				}
+				*devices = append(*devices, DeviceInfo{
+					PCIAddress:       pciAddress,
+					NetworkInterface: networkInterface,
+					LinkState:        linkState,
+				})
+			}
+		}
+	}
+}
+
+func getLinkState(networkInterface string) (string, error) {
+	linkStatePath := fmt.Sprintf("/sys/class/net/%s/operstate", networkInterface)
+	content, err := ioutil.ReadFile(linkStatePath)
+	if err != nil {
+		return "", err
+	}
+
+	linkState := strings.TrimSpace(string(content))
+	return linkState, nil
+}
